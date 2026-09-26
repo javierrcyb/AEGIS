@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+shap
+ruptures
+joblib
+streamlit
+requests
