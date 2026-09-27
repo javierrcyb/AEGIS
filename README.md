@@ -110,6 +110,8 @@ dataset.
 
 First, you need to build the dataset and the model (just once):
 
+Download the dataser in https://archive.ics.uci.edu/dataset/791/metropt%2B3%2Bdataset and add to data/raw and change the name to metropt3_raw.csv
+
 ```bash
     python scripts/prepare_metropt3.py          # Download and tag (see instructions within the script)
 python scripts/build_features_metropt3.py
