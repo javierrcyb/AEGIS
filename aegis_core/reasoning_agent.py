@@ -18,6 +18,15 @@ from aegis_core.evidence_engine import Evidence
 OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "llama3.2:3b"
 
+def list_ollama_models(host: str = OLLAMA_HOST) -> list:
+    try:
+        response = requests.get(f"{host}/api/tags", timeout=3)
+        response.raise_for_status()
+        data = response.json()
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
 
 SYSTEM_PROMPT = """You are AEGIS, an industrial reliability reasoning assistant.
 
@@ -37,6 +46,13 @@ null — this means the health_score is based ONLY on unsupervised anomaly \
 detection. In that case you MUST say explicitly that there is no historical \
 fault-labeled model backing this diagnosis, and that risk_level reflects \
 statistical abnormality, not a learned failure probability.
+- risk_level is already derived FROM health_score by the system (HIGH \
+risk_level means LOW health_score, by definition — they move in opposite \
+directions). Never independently characterize health_score as "high" or \
+"low" in your own words; describe machine condition using risk_level "
+directly (e.g. a HIGH risk_level means the machine's health is degraded, \
+not "high"). Do not produce a sentence that assigns "high" to both \
+risk_level and health in the same breath — that is a contradiction.
 - When has_supervised_model is true: risk_level (how abnormal it looks) and \
 confidence_label (how reliable the conclusion is) are DIFFERENT things. A \
 high risk_level with LOW confidence means "something looks wrong, but we're \

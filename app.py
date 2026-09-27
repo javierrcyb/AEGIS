@@ -31,7 +31,10 @@ from aegis_core.ml_engine import (
     prepare_training_data,
     train_and_evaluate_all,
     select_best_model,
+    PIPELINE_OUTPUT_COLS,
 )
+
+from aegis_core.reasoning_agent import aegis_reasoning, list_ollama_models, DEFAULT_MODEL
 
 DEMO_DATA_PATH = "data/processed/metropt3_final.csv"
 DEMO_MODEL_PATH = "models/aegis_classifier.joblib"
@@ -101,7 +104,7 @@ def _load_demo_mode():
 def _load_upload_mode():
     uploaded = st.sidebar.file_uploader("Upload My Own CSV", type="csv")
     if uploaded is None:
-        st.info("I uploaded a CSV file in the sidebar to get started. It needs at least one date/time column and numeric columns for sensor data.")
+        st.info("Upload a CSV file in the sidebar to get started. It needs at least one date/time column and numeric columns for sensor data.")
         return None, None, None, []
 
     raw_df = pd.read_csv(uploaded)
@@ -112,9 +115,13 @@ def _load_upload_mode():
     ts_index = ts_options.index(ts_guess) if ts_guess in ts_options else 0
     ts_col = st.sidebar.selectbox("Timestamp Column", ts_options, index=ts_index)
 
-    numeric_candidates = raw_df.select_dtypes(include="number").columns.tolist()
+    numeric_candidates_all = raw_df.select_dtypes(include="number").columns.tolist()
+    binary_like = [c for c in numeric_candidates_all if raw_df[c].dropna().nunique() <= 2]
+    numeric_candidates = [c for c in numeric_candidates_all if c not in binary_like]
     default_cols = numeric_candidates[: min(6, len(numeric_candidates))]
     value_columns = st.sidebar.multiselect("Columns to Analyze", numeric_candidates, default=default_cols)
+    if binary_like:
+        st.sidebar.caption(f"Binary columns excluded from signal analysis (possible failure labels): {binary_like}")
 
     file_key = f"{uploaded.name}_{uploaded.size}_{ts_col}_{tuple(value_columns)}"
     analyze_clicked = st.sidebar.button("Analyze dataset", type="primary")
@@ -150,6 +157,8 @@ def _offer_supervised_training(raw_df, ts_col, value_columns, result, file_key):
     and if the user wants, trains on it, but NEVER automatically.
     """
     with st.sidebar.expander("Supervised training (optional)"):
+        if f"train_summary_{file_key}" in st.session_state:
+            st.success(st.session_state[f"train_summary_{file_key}"])
         candidates = detect_label_column_candidates(raw_df, exclude_cols=[ts_col] + value_columns)
         if not candidates:
             st.caption("No binary (0/1) column was detected that could be a failure label.")
@@ -197,15 +206,23 @@ def _offer_supervised_training(raw_df, ts_col, value_columns, result, file_key):
                         results = train_and_evaluate_all(X_train, y_train, X_test, y_test)
                         best = select_best_model(results, by="pr_auc")
                         elapsed = _time.time() - t0
-                        st.success(f"Done in {elapsed:.1f} actual seconds. Best model: {best.name} (PR-AUC {best.pr_auc:.3f})")
+                        summary_msg = f"Done in {elapsed:.1f} actual seconds. Best model: {best.name} (PR-AUC {best.pr_auc:.3f})"
+                        st.session_state[f"train_summary_{file_key}"] = summary_msg
+                        st.session_state["uploaded_trained_model"] = {"model": best.model,
+                                                                      "feature_columns": list(X.columns)}
+                        st.success(summary_msg)
 
                         new_df, has_model, layer_warnings = apply_supervised_layer(
                             result.df, model=best.model, model_feature_columns=list(X.columns)
                         )
                         from aegis_core.pipeline import AnalysisResult
+                        carried_warnings = [
+                            w for w in result.warnings
+                            if "no trained supervised model" not in w.lower()
+                        ]
                         new_result = AnalysisResult(
                             df=new_df, profile=result.profile, has_supervised_model=has_model,
-                            value_columns=result.value_columns, warnings=result.warnings + layer_warnings,
+                            value_columns=result.value_columns, warnings=carried_warnings + layer_warnings,
                         )
                         st.session_state[file_key + "_trained"] = new_result
                         st.rerun()
@@ -303,6 +320,12 @@ def _downsample_for_plot(data, max_points: int = 3000):
 def page_ai_analysis(df: pd.DataFrame, has_model: bool, is_demo: bool):
     st.header("AI Analysis")
     st.caption("The local LLM reasons ONLY based on the evidence that has already been computed")
+    installed_models = list_ollama_models()
+    if installed_models:
+        llm_model = st.selectbox("Local Model (Ollama)", installed_models)
+    else:
+        st.warning(
+            "I couldn't access Ollama at localhost:11434 -> Typed the model name manually.")
 
     if not has_model:
         st.warning(
@@ -332,8 +355,6 @@ def page_ai_analysis(df: pd.DataFrame, has_model: bool, is_demo: bool):
     col1.metric("Health Score", f"{row['health_score']:.1f}")
     col2.metric("Anomaly Score", f"{row['anomaly_score']:.3f}")
     col3.metric("Model Probability", f"{row['model_probability']:.3f}" if has_model and pd.notna(row.get("model_probability")) else "N/A")
-
-    llm_model = st.text_input("Local model (Ollama)", value=DEFAULT_MODEL)
 
     if st.button("Generate an AEGIS diagnostic report"):
         with st.spinner("Calculating evidence and calling the local LLM (may take 10–30 seconds)..."):
@@ -399,17 +420,18 @@ def page_models(df: pd.DataFrame, value_columns: list, has_model: bool, is_demo:
         return
 
     st.subheader("Global feature importance (SHAP, based on a sample)")
-    if is_demo and st.button("Calculate global SHAP (takes ~1 min)"):
-        with st.spinner("Calculating ..."):
-            model, feature_columns = load_demo_model(DEMO_MODEL_PATH, DEMO_COLUMNS_PATH)
-            sample = df.sample(min(5000, len(df)), random_state=42)
-            X_sample = build_feature_matrix(sample[DEMO_VALUE_COLUMNS + ["regime", "anomaly_score"]], exclude_cols=[])
-            X_sample = X_sample.reindex(columns=feature_columns, fill_value=0)
-            shap_df, _ = compute_shap_values(model, X_sample, background_sample_size=200)
-            importance = global_feature_importance(shap_df)
-            st.bar_chart(importance)
 
     if is_demo:
+        if st.button("Calculate global SHAP (takes ~1 min)"):
+            with st.spinner("Calculating ..."):
+                model, feature_columns = load_demo_model(DEMO_MODEL_PATH, DEMO_COLUMNS_PATH)
+                sample = df.sample(min(5000, len(df)), random_state=42)
+                X_sample = build_feature_matrix(sample[DEMO_VALUE_COLUMNS + ["regime", "anomaly_score"]], exclude_cols=[])
+                X_sample = X_sample.reindex(columns=feature_columns, fill_value=0)
+                shap_df, _ = compute_shap_values(model, X_sample, background_sample_size=200)
+                importance = global_feature_importance(shap_df)
+                st.bar_chart(importance)
+
         st.subheader("Model Comparison (leave-one-event-out)")
         st.caption("Averaged metrics across the 4 actual events, using the ‘core’ feature set.")
         comparison = pd.DataFrame({
@@ -421,6 +443,25 @@ def page_models(df: pd.DataFrame, value_columns: list, has_model: bool, is_demo:
         st.caption(
             "Note: Performance varies significantly depending on the duration and severity of the excluded event."
         )
+
+    elif "uploaded_trained_model" in st.session_state:
+        if st.button("Calculate global SHAP (takes ~1 min)"):
+            with st.spinner("Calculating ..."):
+                trained = st.session_state["uploaded_trained_model"]
+                model, feature_columns = trained["model"], trained["feature_columns"]
+                sample = df.sample(min(5000, len(df)), random_state=42)
+                X_sample = build_feature_matrix(sample, exclude_cols=PIPELINE_OUTPUT_COLS)
+                X_sample = X_sample.reindex(columns=feature_columns, fill_value=0)
+                shap_df, _ = compute_shap_values(model, X_sample, background_sample_size=200)
+                importance = global_feature_importance(shap_df)
+                st.bar_chart(importance)
+        st.caption(
+            "This model was trained on your uploaded dataset — there is no leave-one-event-out "
+            "comparison available for it, since that requires multiple known historical events."
+        )
+
+    else:
+        st.caption("No trained model available yet for this dataset.")
 
 
 # PAGE 5 — Data
